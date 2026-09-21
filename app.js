@@ -576,7 +576,7 @@ function renderCard() {
     </div>
     <div class="rates" id="rates" style="display:none">
       <button class="rate r1" onclick="rate('Hard')">🤔 ยาก</button>
-      <button class="rate r2" onclick="rate('Good')">😊 ดี</button>
+      <button class="rate r2" onclick="rate('Medium')">😊 ปานกลาง</button>
       <button class="rate r3" onclick="rate('Easy')">😄 ง่าย</button>
     </div>
     ${navBar('study')}`;
