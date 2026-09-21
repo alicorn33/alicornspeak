@@ -1,10 +1,29 @@
 /* ==========================================================================
    AlicornSpeak — Main Application Logic (Frontend)
-   Fully client-side (localStorage). API_BASE is reserved for a future
-   backend sync feature and is not currently used.
+   Data lives in PostgreSQL via the backend in /server. localStorage is only
+   used as an instant-load cache so the app doesn't flash empty on refresh —
+   the database is always the source of truth.
    ========================================================================== */
 
-const API_BASE = 'http://localhost:3000';
+const API_BASE = 'http://localhost:3000/api'; // ต้องรัน backend (ดู /server) ก่อนใช้งานหน้านี้
+
+async function apiGet(path) {
+  const res = await fetch(API_BASE + path);
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || 'เชื่อมต่อเซิร์ฟเวอร์ไม่สำเร็จ');
+  return res.json();
+}
+async function apiSend(method, path, body) {
+  const res = await fetch(API_BASE + path, {
+    method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {})
+  });
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || 'เชื่อมต่อเซิร์ฟเวอร์ไม่สำเร็จ');
+  return res.json();
+}
+// สำหรับการซิงก์ข้อมูลที่ไม่จำเป็นต้องรอผล (บันทึกไว้ในเครื่องก่อนแล้ว) —
+// ถ้า backend ปิดอยู่หรือเน็ตหลุด จะไม่ทำให้หน้าเว็บค้าง แค่ log แจ้งเตือนใน console
+function syncQuiet(promise) {
+  promise.catch(e => console.warn('ซิงก์ข้อมูลไปเซิร์ฟเวอร์ไม่สำเร็จ (ข้อมูลยังอยู่ในเครื่องนี้):', e.message));
+}
 
 function loadUser() {
   try { return JSON.parse(localStorage.getItem('alicorn_user') || 'null'); }
@@ -75,6 +94,29 @@ function touchStreak() {
   saveUser();
 }
 
+// เวอร์ชันที่ให้เซิร์ฟเวอร์เป็นผู้ตัดสิน (กันกรณีเปิดเครื่องอื่นแล้วนาฬิกาเครื่องไม่ตรงกัน)
+async function touchStreakServer() {
+  if (!user) return;
+  try {
+    const result = await apiSend('POST', `/users/${user.id}/streak`, {});
+    user.stats.streak = result.streak;
+    user.stats.lastActiveDate = result.lastActiveDate;
+    saveUser();
+  } catch (e) { console.warn('ซิงก์ streak ไม่สำเร็จ:', e.message); }
+}
+
+// ดึงข้อมูลล่าสุดจากฐานข้อมูลมาทับ cache ในเครื่อง (เผื่อมีการแก้ไขจากที่อื่น)
+async function hydrateFromServer() {
+  if (!user) return;
+  try {
+    const fresh = await apiGet(`/users/${user.id}`);
+    user = fresh;
+    saveUser();
+    applyPrefs();
+    if (document.querySelector('.navitem.active span')) showDash();
+  } catch (e) { console.warn('ดึงข้อมูลล่าสุดจากเซิร์ฟเวอร์ไม่สำเร็จ:', e.message); }
+}
+
 function ensureTodayRecord() {
   if (!user) return null;
   if (!user.stats) user.stats = { streak: 0, lastActiveDate: null, daily: {} };
@@ -87,9 +129,12 @@ function tickMinutes() {
   if (!user) return;
   const rec = ensureTodayRecord();
   const now = Date.now();
-  if (lastTickTs) rec.minutes += Math.min((now - lastTickTs) / 60000, 5);
+  let delta = 0;
+  if (lastTickTs) delta = Math.min((now - lastTickTs) / 60000, 5);
   lastTickTs = now;
+  rec.minutes += delta;
   saveUser();
+  if (delta > 0) syncQuiet(apiSend('POST', `/users/${user.id}/progress`, { minutesDelta: delta }));
 }
 
 function recordAnswer(correct) {
@@ -98,6 +143,7 @@ function recordAnswer(correct) {
   rec.studied++;
   if (correct) rec.correct++;
   saveUser();
+  syncQuiet(apiSend('POST', `/users/${user.id}/progress`, { studiedDelta: 1, correctDelta: correct ? 1 : 0 }));
 }
 
 function statsSummary() {
@@ -148,6 +194,7 @@ function toggleLdFont() {
   user.prefs = user.prefs || {};
   user.prefs.ldFont = !user.prefs.ldFont;
   saveUser(); applyPrefs(); showProfile();
+  syncQuiet(apiSend('PATCH', `/users/${user.id}`, { prefs: user.prefs }));
 }
 
 function setFontScale(scale) {
@@ -155,6 +202,7 @@ function setFontScale(scale) {
   user.prefs = user.prefs || {};
   user.prefs.fontScale = scale;
   saveUser(); applyPrefs(); showProfile();
+  syncQuiet(apiSend('PATCH', `/users/${user.id}`, { prefs: user.prefs }));
 }
 
 function setSpeechRate(rate) {
@@ -162,6 +210,7 @@ function setSpeechRate(rate) {
   user.prefs = user.prefs || {};
   user.prefs.speechRate = rate;
   saveUser(); applyPrefs(); showProfile();
+  syncQuiet(apiSend('PATCH', `/users/${user.id}`, { prefs: user.prefs }));
 }
 
 /* ================= Vocabulary bank & spaced repetition ================= */
@@ -229,8 +278,10 @@ function updateSrs(word, rating) {
   else if (rating === 'Good') { rec.reps = (rec.reps || 0) + 1; interval = rec.interval ? Math.round(rec.interval * 2.0) : 3; }
   else { rec.reps = (rec.reps || 0) + 1; interval = rec.interval ? Math.round(rec.interval * 2.8) : 7; }
   interval = Math.min(interval, 60);
-  user.srs[word] = { interval, reps: rec.reps, due: daysAgoStr(-interval) };
+  const due = daysAgoStr(-interval);
+  user.srs[word] = { interval, reps: rec.reps, due };
   saveUser();
+  syncQuiet(apiSend('PUT', `/users/${user.id}/srs`, { word, interval, reps: rec.reps, due }));
 }
 
 /* ================= Small UI helpers ================= */
@@ -367,33 +418,25 @@ async function processAuth(reg) {
     return;
   }
 
-  if (reg) {
-    user = {
-      userId: 'user_' + Date.now(),
-      username, fullName: fullName || username,
-      cefrLevel: placementLevel || 'A1',
-      isLd, unlockedLevel: 1,
-      prefs: { ldFont: isLd, fontScale: isLd ? 1.15 : 1, speechRate: isLd ? 0.7 : 0.85 },
-      srs: {},
-      stats: { streak: 0, lastActiveDate: null, daily: {} }
-    };
-  } else if (!user) {
-    // No real backend: a login with no local account just starts a fresh local profile.
-    user = {
-      userId: 'user_' + Date.now(),
-      username, fullName: username,
-      cefrLevel: 'A1', isLd: false, unlockedLevel: 1,
-      prefs: { ldFont: false, fontScale: 1, speechRate: 0.85 },
-      srs: {}, stats: { streak: 0, lastActiveDate: null, daily: {} }
-    };
-  }
+  const btn = event?.target;
+  if (btn) { btn.disabled = true; btn.textContent = 'กำลังเชื่อมต่อ...'; }
 
-  saveUser();
-  placementLevel = null;
-  applyPrefs();
-  touchStreak();
-  toast(reg ? '🎉 สมัครสมาชิกสำเร็จ!' : '👋 ยินดีต้อนรับกลับมาครับ');
-  showDash();
+  try {
+    const data = reg
+      ? await apiSend('POST', '/auth/register', { username, password, fullName, isLd, cefrLevel: placementLevel || 'A1' })
+      : await apiSend('POST', '/auth/login', { username, password });
+    user = data;
+    saveUser();
+    placementLevel = null;
+    applyPrefs();
+    touchStreak();
+    touchStreakServer();
+    toast(reg ? '🎉 สมัครสมาชิกสำเร็จ!' : '👋 ยินดีต้อนรับกลับมาครับ');
+    showDash();
+  } catch (e) {
+    toast('❌ ' + (e.message || 'เชื่อมต่อเซิร์ฟเวอร์ไม่ได้ กรุณาตรวจสอบว่าเปิด backend ไว้หรือยัง'));
+    if (btn) { btn.disabled = false; btn.textContent = reg ? 'สมัครสมาชิก' : 'เข้าสู่ระบบ'; }
+  }
 }
 
 function logout() {
@@ -692,6 +735,7 @@ function finishLearnLevel() {
     user.unlockedLevel = Math.min(LEARN_LEVELS.length, learnLevel + 1);
     user.cefrLevel = currentCefr();
     saveUser();
+    syncQuiet(apiSend('PATCH', `/users/${user.id}`, { unlockedLevel: user.unlockedLevel, cefrLevel: user.cefrLevel }));
   }
   document.getElementById('app').innerHTML = `
     <div style="text-align:center;padding-top:3rem">
@@ -739,5 +783,9 @@ function showProgress(tab) {
 
 /* ================= Boot ================= */
 applyPrefs();
-if (user) { touchStreak(); }
+if (user) {
+  touchStreak();       // อัปเดตทันทีจาก cache ในเครื่อง ให้ UI ไม่กระตุก
+  touchStreakServer(); // แล้วให้เซิร์ฟเวอร์ยืนยันอีกที (เผื่อนาฬิกาเครื่องไม่ตรง)
+  hydrateFromServer(); // ดึงข้อมูลล่าสุดจากฐานข้อมูลมาทับ cache
+}
 user ? showDash() : showHome();
